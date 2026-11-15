@@ -90,7 +90,8 @@ hf-hub = { version = "0.5", optional = true, default-features = false }
 rustfft = { version = "6.4.1", optional = true }
 kodama = "0.3.0"
 ndarray = { version = "0.17.2", features = ["matrixmultiply-threading"] }
-ndarray-npy = "0.10.0"
+# The library reads only `.npy`; the default features add `.npz` through an old `zip`.
+ndarray-npy = { version = "0.10.0", default-features = false }
 
 ort = { version = "2.0.0-rc.13", features = ["ndarray"], optional = true }
 
@@ -182,6 +183,8 @@ sha2 = "0.10"
 libloading = "0.9.0"
 approx = "0.5.1"
 serde_json = "1"
+# reads the `.npz` captures of the pinned CPU acceptance tests
+zip = { version = "9.2.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 
 # native model tests need optimized kernels; test assertions remain enabled
