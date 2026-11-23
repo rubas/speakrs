@@ -1,5 +1,7 @@
 #[cfg(any(feature = "coreml", feature = "_metrics"))]
 use crate::inference::CoreMlComputeUnits;
+#[cfg(feature = "coreml")]
+use crate::inference::CoreMlSegmentationBatch;
 #[cfg(feature = "_cuda-libraries")]
 use crate::inference::CudaLstmAlgorithm;
 use crate::inference::ExecutionMode;
@@ -219,18 +221,26 @@ impl PipelineConfig {
     }
 
     /// Mode-specific defaults. Fast modes use min-duration filtering to remove
-    /// single-frame speaker flicker from the larger step size.
+    /// single-frame speaker flicker from the larger step size, and stop VBx after
+    /// three iterations with a speaker-keep threshold of `1e-6` instead of `1e-7`.
     pub fn for_mode(mode: ExecutionMode) -> Self {
         match mode {
             ExecutionMode::CoreMlFast | ExecutionMode::CudaFast => Self {
                 activity: ActivityCleanup::new(3, 3, 0, 0),
-                clustering: ClusteringConfig::default().with_backend(
-                    ClusteringBackend::GaussianVbx(
+                clustering: ClusteringConfig::default()
+                    .with_backend(ClusteringBackend::GaussianVbx(
                         VbxConfig::default()
                             .with_max_iters(3)
                             .expect("fast-mode iteration count is valid"),
-                    ),
-                ),
+                    ))
+                    // pyannote's 1e-7 assumes VBx ran to convergence; after three
+                    // iterations, fragmented AHC clusters still sit above it (270 of
+                    // 1916 on CHiME-6 S21), and assignment and reconstruction scale
+                    // with every cluster kept. Higher thresholds start dropping real
+                    // speakers: 1e-5 raises VoxConverse dev DER and 2e-5 merges S21
+                    // into two speakers
+                    .with_speaker_keep_threshold(1e-6)
+                    .expect("fast-mode keep threshold is valid"),
                 ..Self::default()
             },
             _ => Self::default(),
@@ -275,6 +285,8 @@ pub enum CoreMlShapeLadder {
 }
 
 /// Segmentation worker count used by metrics experiments
+///
+/// The batched CoreML segmentation path runs at most three of these workers at once
 #[cfg(feature = "_metrics")]
 #[cfg_attr(docsrs, doc(cfg(feature = "_metrics")))]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -745,6 +757,13 @@ pub struct RuntimeConfig {
     #[cfg(feature = "coreml")]
     #[cfg_attr(docsrs, doc(cfg(feature = "coreml")))]
     pub chunk_emb_compute_units: CoreMlComputeUnits,
+    /// Largest batch the segmentation model runs per prediction (CoreML modes only)
+    ///
+    /// [`CoreMlSegmentationBatch::Batch64`] by default. A smaller batch lowers peak memory,
+    /// which matters on 8 GB Macs; see [`CoreMlSegmentationBatch`] for measurements
+    #[cfg(feature = "coreml")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "coreml")))]
+    pub coreml_segmentation_batch: CoreMlSegmentationBatch,
     /// Precision of the segmentation model's cuBLAS GEMMs, cuDNN convolutions and cuDNN
     /// LSTM (CUDA modes only)
     ///
@@ -788,6 +807,8 @@ impl Default for RuntimeConfig {
             fbank_threads: OrtThreadCount::default(),
             #[cfg(feature = "coreml")]
             chunk_emb_compute_units: CoreMlComputeUnits::default(),
+            #[cfg(feature = "coreml")]
+            coreml_segmentation_batch: CoreMlSegmentationBatch::default(),
             // segmentation TF32 failed the per-file DER gate on VoxConverse-dev while
             // embedding TF32 and the persistent LSTM passed, see the CUDA DER report
             cuda_segmentation_math: CudaMath::Fp32,
@@ -811,6 +832,14 @@ impl RuntimeConfig {
     /// Select the thread count for each MIGraphX ONNX Runtime CPU filterbank session
     pub const fn with_fbank_threads(mut self, threads: OrtThreadCount) -> Self {
         self.fbank_threads = threads;
+        self
+    }
+
+    /// Select the largest batch the CoreML segmentation model runs per prediction
+    #[cfg(feature = "coreml")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "coreml")))]
+    pub const fn with_coreml_segmentation_batch(mut self, batch: CoreMlSegmentationBatch) -> Self {
+        self.coreml_segmentation_batch = batch;
         self
     }
 
@@ -1039,6 +1068,30 @@ mod clean_frame_duration_tests {
         assert_eq!(fast.max_iters(), 3);
         assert_eq!(segmentation_step_seconds(ExecutionMode::CoreMl), 1.0);
         assert_eq!(segmentation_step_seconds(ExecutionMode::CoreMlFast), 2.0);
+    }
+
+    // losing the fast-mode threshold brings back hundreds of kept clusters on
+    // fragmented recordings, and only a long far-field run would show it
+    #[test]
+    fn fast_modes_prune_unconverged_speakers() {
+        for mode in [ExecutionMode::CoreMlFast, ExecutionMode::CudaFast] {
+            let threshold = PipelineConfig::for_mode(mode)
+                .clustering
+                .speaker_keep_threshold();
+            assert_eq!(threshold, 1e-6, "{mode}");
+        }
+
+        for mode in [
+            ExecutionMode::Cpu,
+            ExecutionMode::CoreMl,
+            ExecutionMode::Cuda,
+            ExecutionMode::MiGraphX,
+        ] {
+            let threshold = PipelineConfig::for_mode(mode)
+                .clustering
+                .speaker_keep_threshold();
+            assert_eq!(threshold, 1e-7, "{mode}");
+        }
     }
 
     #[test]

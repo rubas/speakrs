@@ -1,7 +1,8 @@
 //! Host-only proof that timing cannot create an execution permission
 
+use cudakit::{DeviceAttributes, DeviceAttributesBuilder as Builder};
+
 use super::{ApprovedChoice, BenchmarkMeasurement, Catalogue, Tuple, select_winners};
-use crate::inference::cuda::device::{DeviceAttributes, test_support::Builder};
 use crate::inference::cuda::implementation::BoundaryId;
 use crate::inference::cuda::{ComputeCapability, CudaMath, PtxTier};
 
@@ -860,7 +861,7 @@ fn fp16_embedding_default_leaves_an_approved_tf32_alternative() {
 #[test]
 #[cfg(any(feature = "cuda-sm75", feature = "cuda-sm80"))]
 fn catalogue_contains_every_measured_stride2_fp16_startup_pin() {
-    use crate::inference::cuda::candidate::{ConfigPin, WideconvPin};
+    use crate::inference::cuda::candidate::{ConfigPin, Fp16Policy, WideconvPin};
     use crate::inference::cuda::implementation::policy::Recipe;
     let mut checked = 0;
     for (cc, sms, name, tier, recipe, minimum_batches) in [
@@ -914,7 +915,9 @@ fn catalogue_contains_every_measured_stride2_fp16_startup_pin() {
         {
             let boundary = BoundaryId::named(name);
             for batch in boundary.batches().iter().filter(|batch| *batch >= minimum) {
-                let pin = recipe.fp16_pin(boundary, batch, CudaMath::Tf32).unwrap();
+                let pin = recipe
+                    .fp16_pin(boundary, batch, CudaMath::Tf32, Fp16Policy::Allowed)
+                    .unwrap();
                 assert!(pin.is_fp16(), "{recipe:?} {name} b{batch}");
                 let tuple = Tuple::new(boundary, batch, CudaMath::Tf32).unwrap();
                 assert!(

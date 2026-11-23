@@ -34,10 +34,11 @@ clippy:
         # the CoreML-only build has no ONNX Runtime, so check it for dead code separately
         cargo clippy -p speakrs --all-targets --no-default-features --features "online coreml" -- -D warnings
         # Linux-only CUDA tests never compile for a macOS host, so lint them for the Linux target
-        # zig cross-compiles the C dependencies; `online` is left out because it needs Linux OpenSSL
+        # zig cross-compiles the C dependencies; `online` is left out because the host run above
+        # already lints `online cuda`
         if command -v zig >/dev/null; then
             for features in cuda cuda-sm75 cuda-rtx50; do
-                CC_x86_64_unknown_linux_gnu="zig cc -target x86_64-linux-gnu" AR_x86_64_unknown_linux_gnu="zig ar" \
+                CC_x86_64_unknown_linux_gnu="$PWD/scripts/zig-cc-x86_64-linux.sh" AR_x86_64_unknown_linux_gnu="zig ar" \
                     cargo clippy -p speakrs --all-targets --no-default-features --features "$features" \
                     --target x86_64-unknown-linux-gnu -- -D warnings
             done
@@ -84,13 +85,9 @@ bump level:
     # updates speakrs and the shared [workspace.package] version of the artifact crates
     sed -i '' "s/^version = \"${CURRENT}\"/version = \"${NEW}\"/" Cargo.toml
     sed -i '' "s/version = \"=${CURRENT}\"/version = \"=${NEW}\"/" Cargo.toml
-    cargo generate-lockfile --quiet
+    # only the workspace crates change version; generate-lockfile would also upgrade every dependency
+    cargo update --workspace --quiet
     echo "Bumped ${CURRENT} → ${NEW}"
-
-# Publish speakrs and its CUDA artifact crates together: just publish [--dry-run]
-# the artifact crates go first, and verification needs a backend feature
-publish *args:
-    cargo publish --locked -p speakrs-ptx-sm75 -p speakrs-ptx-sm80 -p speakrs-ptx-sm120 -p speakrs --features speakrs/cpu {{args}}
 
 # passthrough to cargo xtask
 x *args:

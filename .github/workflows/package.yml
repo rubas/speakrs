@@ -136,8 +136,8 @@ jobs:
           done
           check_consumer cuda "{ path = \"$package_path\", default-features = false, features = [\"cuda\"] }" "$ptx_patch"
 
-  # one abi3 wheel per platform; the Linux wheel is also the CUDA wheel, and it
-  # builds without a GPU or CUDA toolkit because CUDA is loaded at run time
+  # one abi3 wheel per platform; the Linux and Windows wheels are also the CUDA wheels,
+  # and they build without a GPU or CUDA toolkit because CUDA is loaded at run time
   python-wheels:
     name: Python wheel (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
@@ -153,8 +153,22 @@ jobs:
             os: macos-15
             target: aarch64-apple-darwin
             manylinux: "off"
+          - name: Windows x86_64, CPU + CUDA
+            os: windows-2025
+            target: x86_64-pc-windows-msvc
+            manylinux: "off"
     steps:
       - uses: actions/checkout@v6
+
+      # Git for Windows checks a symlink out as a text file holding its target, so the
+      # wheel would ship that path as its license; rm first, since cp through a real
+      # symlink would copy the file onto itself
+      - name: Copy the license over its symlink
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          rm -f crates/speakrs-python/LICENSE
+          cp LICENSE crates/speakrs-python/LICENSE
 
       - name: Build wheel
         uses: PyO3/maturin-action@v1.51.0
@@ -238,6 +252,9 @@ jobs:
           - name: macOS arm64
             os: macos-15
             target: aarch64-apple-darwin
+          - name: Windows x86_64
+            os: windows-2025
+            target: x86_64-pc-windows-msvc
     env:
       SPEAKRS_MODEL_FIXTURE_REV: 67f963b6a1d94fcd4678948237b3cc8bd69bf1d8
     steps:
@@ -282,15 +299,22 @@ jobs:
           uv pip install --python .venv-wheel dist/*.whl pytest numpy
 
       - name: Run tests
+        shell: bash
         working-directory: crates/speakrs-python
-        run: ../../.venv-wheel/bin/python -m pytest -rA
+        run: |
+          set -euo pipefail
+          # Windows venvs keep the interpreter in Scripts, not bin
+          python=../../.venv-wheel/bin/python
+          if [ "$RUNNER_OS" = Windows ]; then python=../../.venv-wheel/Scripts/python.exe; fi
+          "$python" -m pytest -rA
 
   # a v* tag publishes to TestPyPI, installs that release, and only then publishes to
-  # PyPI; each index trusts this workflow and environment, so no token is stored
+  # PyPI and then crates.io; each index trusts this workflow and environment, so no
+  # token is stored
   testpypi-publish:
     name: Publish to TestPyPI
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [python-wheels, python-sdist, python-tests]
+    needs: [crate, python-wheels, python-sdist, python-tests]
     runs-on: ubuntu-24.04
     environment:
       name: testpypi
@@ -311,7 +335,8 @@ jobs:
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
           ls -la dist
-          test "$(find dist -type f | wc -l)" -eq 3
+          # the Linux, macOS and Windows wheels and the sdist
+          test "$(find dist -type f | wc -l)" -eq 4
           for file in dist/*; do
             case "$(basename "$file")" in
               "speakrs-${version}"-*.whl | "speakrs-${version}.tar.gz") ;;
@@ -336,6 +361,8 @@ jobs:
             os: ubuntu-24.04
           - name: macOS arm64
             os: macos-15
+          - name: Windows x86_64
+            os: windows-2025
     steps:
       - uses: actions/checkout@v6
 
@@ -347,6 +374,9 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
+          # Windows venvs keep their programs in Scripts, not bin
+          bin=.venv-release/bin
+          if [ "$RUNNER_OS" = Windows ]; then bin=.venv-release/Scripts; fi
           uv venv --python 3.12 .venv-release
           # a new release can take a few minutes to appear in the index
           for attempt in 1 2 3 4 5 6 7 8 9 10; do
@@ -357,8 +387,8 @@ jobs:
             test "$attempt" -lt 10
             sleep 30
           done
-          .venv-release/bin/python -c "import speakrs; print(speakrs.__version__, speakrs.available_modes())"
-          rttm="$(.venv-release/bin/speakrs diarize --mode cpu fixtures/test_short.wav)"
+          "$bin/python" -c "import speakrs; print(speakrs.__version__, speakrs.available_modes())"
+          rttm="$("$bin/speakrs" diarize --mode cpu fixtures/test_short.wav)"
           printf '%s\n' "$rttm"
           grep -q '^SPEAKER ' <<< "$rttm"
 
@@ -381,3 +411,73 @@ jobs:
 
       - name: Publish
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+
+  # crates.io trusts this workflow and the crates-io environment for speakrs and each
+  # speakrs-ptx-* crate
+  crates-publish:
+    name: Publish to crates.io
+    needs: pypi-publish
+    runs-on: ubuntu-24.04
+    environment:
+      name: crates-io
+      url: https://crates.io/crates/speakrs
+    permissions:
+      id-token: write
+    # this job can mint a crates.io token, so every action in it is pinned to a commit
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+
+      # a rerun after a partial publish skips the crates already on crates.io, and a
+      # crate whose version doesn't match the tag fails before anything is uploaded
+      - name: Pick the crates to publish
+        id: crates
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          metadata="$(cargo metadata --no-deps --format-version 1 --locked)"
+          args=()
+          for crate in speakrs-ptx-sm75 speakrs-ptx-sm80 speakrs-ptx-sm120 speakrs; do
+            manifest="$(jq -r --arg crate "$crate" '.packages[] | select(.name == $crate) | .version' <<< "$metadata")"
+            if [ "$manifest" != "$version" ]; then
+              echo "$crate is $manifest but the tag is $GITHUB_REF_NAME" >&2
+              exit 1
+            fi
+
+            status="$(curl -sS -o /dev/null -w '%{http_code}' -A 'speakrs-release (github.com/avencera/speakrs)' \
+              "https://crates.io/api/v1/crates/$crate/$version")"
+            case "$status" in
+              200) echo "$crate $version is already on crates.io" ;;
+              404) args+=(-p "$crate") ;;
+              *) echo "crates.io answered HTTP $status for $crate" >&2; exit 1 ;;
+            esac
+          done
+
+          # verifying speakrs needs a backend feature
+          if [[ " ${args[*]} " == *" -p speakrs "* ]]; then args+=(--features speakrs/cpu); fi
+          echo "args=${args[*]}" >> "$GITHUB_OUTPUT"
+
+      - name: Get a crates.io token
+        if: steps.crates.outputs.args != ''
+        id: auth
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
+
+      # one workspace publish uploads the artifact crates before speakrs, which pins
+      # their exact version, and waits for each to reach the index
+      - name: Publish
+        if: steps.crates.outputs.args != ''
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+          ARGS: ${{ steps.crates.outputs.args }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          read -ra args <<< "$ARGS"
+          cargo publish --locked "${args[@]}"

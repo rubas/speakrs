@@ -32,10 +32,10 @@ use cudarc::driver::{
     CudaEvent, CudaSlice, CudaStream, CudaView, CudaViewMut, DeviceRepr, ValidAsZeroBits,
 };
 
-use super::device::DeviceAttributes;
 pub(crate) use super::error::{GeometryError, WeightFault};
 use super::geometry::Conv2d;
 use super::{CudaError, CudaMath, CudaRuntime, KernelModule, LoadedKernels, PtxTier, Sgemm};
+use cudakit::DeviceAttributes;
 
 mod conv;
 mod fbank;
@@ -51,6 +51,8 @@ pub(super) use kernel_inventory::conv_kernel_inventory;
 #[cfg(test)]
 mod kernel_inventory {
     pub(crate) const WIDECONV_KERNELS: &[&str] = super::wideconv::entries::ALL;
+    /// Wideconv entries only its sm120 variant exports, which only the RTX 5090 loads
+    pub(crate) const WIDECONV_SM120_KERNELS: &[&str] = super::wideconv::entries::SM120;
 
     /// Every kernel entry a plan can launch, for the PTX inventory check
     pub(crate) const SEGDENSE_KERNELS: [&str; 32] = [
@@ -109,7 +111,7 @@ mod kernel_inventory {
 #[cfg(test)]
 pub(super) use fbank::REQUIRED_KERNELS as FBANK_DFT_KERNELS;
 #[cfg(test)]
-pub(super) use kernel_inventory::{SEGDENSE_KERNELS, WIDECONV_KERNELS};
+pub(super) use kernel_inventory::{SEGDENSE_KERNELS, WIDECONV_KERNELS, WIDECONV_SM120_KERNELS};
 #[cfg(test)]
 pub(super) use lstm::REQUIRED_KERNELS as LSTM_KERNELS;
 #[cfg(test)]
@@ -182,6 +184,12 @@ impl From<cudarc::driver::DriverError> for PlanError {
     }
 }
 
+impl From<cudakit::Error> for PlanError {
+    fn from(error: cudakit::Error) -> Self {
+        Self::Cuda(error.into())
+    }
+}
+
 /// Model batches that accepted records can authorize for production
 pub(crate) const QUALIFIED_BATCHES: [usize; 2] = [1, 32];
 
@@ -236,6 +244,17 @@ impl ConfigPin {
             self,
             Self::Wideconv(WideconvPin::Configured(wideconv::Config {
                 algorithm: WideconvAlgorithm::Fp16(_),
+                ..
+            }))
+        )
+    }
+
+    /// Whether the pin runs FP16 Winograd tiles, which [`Fp16Policy::Direct`] also removes
+    pub(crate) const fn is_fp16_winograd(self) -> bool {
+        matches!(
+            self,
+            Self::Wideconv(WideconvPin::Configured(wideconv::Config {
+                algorithm: WideconvAlgorithm::Fp16(wideconv::Fp16Tiles::Winograd),
                 ..
             }))
         )
@@ -1062,7 +1081,7 @@ impl<'a> Projection<'a> {
             math: self.math,
             ..Sgemm::new(self.rows, gemm.n, k)
         };
-        self.runtime.sgemm(spec, a, weight, c)
+        Ok(self.runtime.sgemm(spec, a, weight, c)?)
     }
 }
 
@@ -1652,7 +1671,7 @@ pub(crate) trait DriverCandidate {
         boundary: super::implementation::BoundaryId,
         batch: usize,
         math: CudaMath,
-        device: &super::device::DeviceAttributes,
+        device: &cudakit::DeviceAttributes,
         tier: PtxTier,
         fp16: Fp16Policy,
     ) -> Result<ConfigPin, PlanError>;

@@ -5,10 +5,6 @@
 //! Selection resolves the module request from the binding before any load, so adding
 //! another embedded tier never changes what an existing binding loads
 
-// runtime wiring is deferred until override policy and input ownership are defined
-#[allow(dead_code)]
-pub(crate) mod overrides;
-
 mod boundary;
 mod driver;
 mod evidence;
@@ -19,6 +15,7 @@ mod production {
     pub(super) mod lstm;
     pub(super) mod resnet;
     pub(super) mod sincnet;
+    pub(super) mod wideconv;
 
     use super::{RecordHash, SpeedEvidence, SpeedScope, SpeedStatus, TupleProof};
     use crate::inference::cuda::candidate::ConfigPin;
@@ -66,6 +63,8 @@ pub(crate) use evidence::{
     SpeedScope, SpeedStatus, TupleProof,
 };
 
+use cudakit::DeviceAttributes;
+
 #[cfg(all(test, feature = "_cuda-libraries"))]
 use super::candidate::{Batches, Coverage, CoverageEntry, Maths};
 use super::candidate::{
@@ -74,9 +73,9 @@ use super::candidate::{
     LstmSpec, PlanError, SegConvCandidate, SegConvOxide, SegConvSpec, SincCandidate, SincOxide,
     SincSpec, WideconvOxide,
 };
-use super::device::DeviceAttributes;
 use super::error::GeometryError;
 use super::kernels::{AreaPtx, LoadedArtifact, ModuleRequest};
+use super::tier::TierPolicy;
 use super::tuning::ApprovedChoice;
 use super::{
     ComputeCapability, CudaError, CudaLibrary, CudaMath, CudaRuntime, KernelModule, PtxTier,
@@ -174,7 +173,8 @@ pub(crate) enum Selected {
 const PRODUCTION: &[Binding] = &[production::lstm::BINDING, production::sincnet::BINDING];
 
 /// Measured complete ports fix artifacts without fabricating qualification records
-const MEASURED_MODULES: &[ModuleBinding] = &[production::resnet::BINDING];
+const MEASURED_MODULES: &[ModuleBinding] =
+    &[production::resnet::BINDING, production::wideconv::BINDING];
 
 // always-on areas retain the artifact policy used before cubins were shipped
 const ALWAYS_ON: &[KernelModule] = &[
@@ -215,7 +215,20 @@ pub(crate) fn production_module(
     variants: AreaPtx,
 ) -> Result<Option<ModuleRequest>, CudaError> {
     let qualified = qualified_module(area, device, limit, variants)?;
-    Ok(qualified.or_else(|| variants.driver_request(area, limit, device.capability())))
+    Ok(qualified
+        .or_else(|| variants.driver_request(area, unbound_limit(area, limit), device.capability())))
+}
+
+/// The highest tier an area loads without a module binding
+///
+/// The wideconv sm120 variant is measured only on the device that binds it; the sm120
+/// build compiles every wideconv kernel differently, so other devices keep the sm80
+/// variant
+fn unbound_limit(area: KernelModule, limit: PtxTier) -> PtxTier {
+    match area {
+        KernelModule::Wideconv => limit.min(PtxTier::Sm90),
+        _ => limit,
+    }
 }
 
 /// Bound artifacts and the always-on baseline, independent of complete port fallback
@@ -257,7 +270,10 @@ fn production_tier(
     }
     bound_production_module(area, device, limit)
         .map(ModuleRequest::tier)
-        .or_else(|| area.variants().runnable_tier(limit, device.capability()))
+        .or_else(|| {
+            area.variants()
+                .runnable_tier(unbound_limit(area, limit), device.capability())
+        })
 }
 
 fn bound_production_module(
@@ -1026,7 +1042,10 @@ impl PlanRequest {
         if matches!(self, Self::Hybrid)
             && let Some(choice) = modules.tune_choice(boundary, batch, math)?
         {
-            if !modules.fp16().allows() && choice.is_fp16() {
+            let fp16 = modules.fp16();
+            if (!fp16.allows() && choice.is_fp16())
+                || (!fp16.allows_winograd() && choice.is_fp16_winograd())
+            {
                 if modules.is_tuning() {
                     return Err(super::tuning::invalid(
                         "FP16 tuning candidate is excluded by the layer weights",

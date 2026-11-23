@@ -7,7 +7,7 @@ use crate::powerset::PowersetMapping;
 
 use super::config::MIN_SPEAKER_ACTIVITY;
 use super::types::{
-    Array3Writer, EmbeddingStorage, PendingEmbedding, PendingSplitEmbedding, PipelineError,
+    Array3Writer, EmbeddingStorage, PendingEmbedding, PipelineError, SplitEmbeddingBatch,
     chunk_audio_raw, flush_masked, flush_split,
 };
 use super::{clean_masks, select_speaker_weights, write_speaker_mask_to_slice};
@@ -36,9 +36,12 @@ struct MultiMaskBatch<'a> {
 /// batch's windows while a batch runs on the device
 trait MultiMaskEmbedder {
     /// Starts `batch`, returning its rows if they are already done
+    ///
+    /// One earlier batch may still be running, so the device can move on to `batch`
+    /// before the host waits for that one
     fn start(&mut self, batch: &MultiMaskBatch<'_>) -> Result<MultiMaskStart, PipelineError>;
 
-    /// Waits for the batch the last [`Self::start`] left running
+    /// Waits for the oldest batch [`Self::start`] left running
     fn wait(&mut self) -> Result<Array2<f32>, PipelineError>;
 }
 
@@ -105,8 +108,7 @@ impl<'a> ConcurrentEmbeddingRunner<'a> {
         let total_windows = self.total_windows();
         let mut seg_array: Option<Array3<f32>> = None;
         let mut emb_array: Option<Array3<f32>> = None;
-        let mut pending: Vec<PendingSplitEmbedding> = Vec::with_capacity(batch_size);
-        let mut fbanks: Vec<Array2<f32>> = Vec::new();
+        let mut batch = SplitEmbeddingBatch::new(batch_size);
         let mut chunk_idx = 0usize;
 
         for raw_window in receiver {
@@ -126,10 +128,6 @@ impl<'a> ConcurrentEmbeddingRunner<'a> {
             );
             let clean = clean_masks(&seg_view);
 
-            let fbank = embedding_model.compute_chunk_fbank(chunk_audio)?;
-            fbanks.push(fbank);
-            let mut current_fbank_idx = fbanks.len() - 1;
-
             for speaker_idx in 0..self.num_speakers {
                 let Some(weights) = select_speaker_weights(
                     &seg_view,
@@ -140,38 +138,28 @@ impl<'a> ConcurrentEmbeddingRunner<'a> {
                 ) else {
                     continue;
                 };
-                pending.push(PendingSplitEmbedding {
-                    chunk_idx,
-                    speaker_idx,
-                    fbank_idx: current_fbank_idx,
-                    weights,
-                });
-                if pending.len() == batch_size {
+                batch.push(chunk_idx, speaker_idx, weights, || {
+                    Ok(embedding_model.compute_chunk_fbank(chunk_audio)?)
+                })?;
+                if batch.is_full() {
                     let emb = emb_array.get_or_insert_with(|| {
                         Array3::from_elem((total_windows, self.num_speakers, 256), f32::NAN)
                     });
-                    flush_split(embedding_model, &pending, &fbanks, &mut Array3Writer(emb))?;
-                    pending.clear();
-
-                    // keep the current chunk fbank alive if later speakers in this chunk still need it
-                    if speaker_idx + 1 < self.num_speakers {
-                        let kept_fbank = fbanks.swap_remove(current_fbank_idx);
-                        fbanks.clear();
-                        fbanks.push(kept_fbank);
-                        current_fbank_idx = 0;
-                    } else {
-                        fbanks.clear();
-                    }
+                    batch.flush(|pending, fbanks| {
+                        flush_split(embedding_model, pending, fbanks, &mut Array3Writer(emb))
+                    })?;
                 }
             }
             chunk_idx += 1;
         }
 
-        if !pending.is_empty() {
+        if !batch.is_empty() {
             let emb = emb_array.get_or_insert_with(|| {
                 Array3::from_elem((total_windows, self.num_speakers, 256), f32::NAN)
             });
-            flush_split(embedding_model, &pending, &fbanks, &mut Array3Writer(emb))?;
+            batch.flush(|pending, fbanks| {
+                flush_split(embedding_model, pending, fbanks, &mut Array3Writer(emb))
+            })?;
         }
 
         self.finalize(seg_array, emb_array, chunk_idx, total_windows)
@@ -188,7 +176,13 @@ impl<'a> ConcurrentEmbeddingRunner<'a> {
             runner: self,
             model: embedding_model,
         };
-        self.run_multi_mask_with(receiver, batch_size, min_num_samples, &mut embedder)
+        let result = self.run_multi_mask_with(receiver, batch_size, min_num_samples, &mut embedder);
+        if result.is_err() {
+            // an early return can leave batches on the model, which the next
+            // recording's starts would trip over
+            embedding_model.discard_multi_mask_batches();
+        }
+        result
     }
 
     fn run_multi_mask_with(
@@ -338,9 +332,9 @@ impl<'a> ConcurrentEmbeddingRunner<'a> {
         self.finalize(seg_array, emb_array, chunk_idx, total_windows)
     }
 
-    /// Waits for the running batch, starts `batch` and stores the waited rows, so the
-    /// device moves on to `batch` before the host stores them; returns the time spent
-    /// in the embedder in microseconds
+    /// Starts `batch`, then waits for the running batch and stores its rows, so the
+    /// device moves on to `batch` before the host waits; returns the time spent in the
+    /// embedder in microseconds
     ///
     /// `running` keeps describing the waited batch until the caller swaps in the
     /// bookkeeping of `batch`, unless `batch` is already done and stored
@@ -352,12 +346,12 @@ impl<'a> ConcurrentEmbeddingRunner<'a> {
         emb: &mut Array3<f32>,
     ) -> Result<u64, PipelineError> {
         let embed_start = std::time::Instant::now();
+        let started = embedder.start(batch)?;
         let waited = if running.running {
             Some(embedder.wait()?)
         } else {
             None
         };
-        let started = embedder.start(batch)?;
         let embed_us = embed_start.elapsed().as_micros() as u64;
 
         if let Some(rows) = waited {
@@ -610,6 +604,7 @@ mod tests {
     use crate::pipeline::types::PipelineError;
     use crate::powerset::PowersetMapping;
     use ndarray::{Array2, s};
+    use std::collections::VecDeque;
 
     /// Runs the multi-mask loop over windows whose first speaker is `active`; batch `n`
     /// finishes at once when `done(n)`, the way non-CUDA backends and the CUDA
@@ -643,14 +638,14 @@ mod tests {
             active,
             done,
             batches: Vec::new(),
-            running: None,
+            running: VecDeque::new(),
             waits: 0,
         };
         let result = runner
             .run_multi_mask_with(receiver, batch_size, 0, &mut embedder)
             .unwrap();
         assert!(
-            embedder.running.is_none(),
+            embedder.running.is_empty(),
             "the last batch was never waited"
         );
         let running = (0..embedder.batches.len()).filter(|&n| !done(n)).count();
@@ -659,18 +654,19 @@ mod tests {
     }
 
     /// Checks each started batch, then returns it done or leaves it running with every
-    /// mask row filled with its window index plus one
+    /// mask row filled with its window index plus one; like the CUDA backend, it allows
+    /// one batch to still run when the next starts
     struct RecordingEmbedder<'a> {
         active: &'a [bool],
         done: fn(usize) -> bool,
         batches: Vec<Vec<usize>>,
-        running: Option<Array2<f32>>,
+        running: VecDeque<Array2<f32>>,
         waits: usize,
     }
 
     impl MultiMaskEmbedder for RecordingEmbedder<'_> {
         fn start(&mut self, batch: &MultiMaskBatch<'_>) -> Result<MultiMaskStart, PipelineError> {
-            assert!(self.running.is_none(), "started a batch while one runs");
+            assert!(self.running.len() <= 1, "started a batch while two run");
             let done = (self.done)(self.batches.len());
             self.batches.push(batch.chunk_indices.to_vec());
             assert_eq!(batch.audio_slices.len(), batch.chunk_indices.len());
@@ -696,13 +692,16 @@ mod tests {
                 return Ok(MultiMaskStart::Done(rows));
             }
 
-            self.running = Some(rows);
+            self.running.push_back(rows);
             Ok(MultiMaskStart::Running)
         }
 
         fn wait(&mut self) -> Result<Array2<f32>, PipelineError> {
             self.waits += 1;
-            Ok(self.running.take().expect("waited without a running batch"))
+            Ok(self
+                .running
+                .pop_front()
+                .expect("waited without a running batch"))
         }
     }
 

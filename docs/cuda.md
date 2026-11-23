@@ -6,14 +6,24 @@ the settings for debugging. For choosing a build, see
 
 ## Requirements
 
-The CUDA backend runs on Linux. It needs an NVIDIA driver and a Turing
-(compute capability 7.5) or newer GPU, and it builds without a CUDA toolkit.
+The CUDA backend runs on Linux and Windows (x86_64). It needs an NVIDIA driver
+and a Turing (compute capability 7.5) or newer GPU, and it builds without a CUDA
+toolkit.
 
 - **GPU-specific builds** (`cuda-rtx20`, `cuda-rtx30`, `cuda-rtx40`,
   `cuda-a100`, `cuda-rtx50`, and the tier features `cuda-sm75`, `cuda-sm80`,
   `cuda-sm90`, `cuda-sm120`) load only the driver.
 - **The `cuda` build** also uses cuDNN 9 and cuBLAS when a selected plan uses
   them, and NVRTC for the `PersistDynamic` LSTM mode.
+- **On Windows** the driver is `nvcuda.dll` from System32, and the libraries are
+  `cudnn64_9.dll`, `cublas64_12.dll` with `cublasLt64_12.dll`, and
+  `nvrtc64_120_0.dll`, found beside the executable, in System32, in absolute
+  `PATH` entries or in `%CUDA_PATH%\bin`, never in the current directory. Tune
+  files need the driver release, which comes from the `nvml.dll` that DCH
+  drivers install in System32. A Standard driver keeps it under
+  `NVIDIA Corporation\NVSMI` instead, so there `speakrs cuda tune` fails and
+  models run with the built-in kernel choices. CI builds the Windows backend and
+  runs its host-only tests, but it hasn't run on a GPU yet.
 
 The family features are aliases for the kernel tiers: `cuda-rtx20` is
 `cuda-sm75`, `cuda-rtx30`, `cuda-rtx40` and `cuda-a100` are `cuda-sm80`, and
@@ -60,6 +70,15 @@ name and SM count.
 - **A100 PCIe-40GB and SXM4-40GB (cc 8.0, 108 SMs):** use FP32 segmentation and
   TF32 embedding.
 - **RTX 4090:** has a measured recipe.
+- **RTX 5090 (cc 12.0, 170 SMs):** with FP32 segmentation and TF32 embedding, uses
+  FP16 trunk kernels for the 32-channel layers at every batch, the 64-channel ones
+  from batch 4, the 128-channel ones from batch 8 and the 256-channel ones from
+  batch 16, stride-2 layers included. It loads its own sm120 build of these
+  kernels, which does twice the FP16 work per tensor instruction and adds FP16
+  Winograd kernels for the same-channel 64-, 128- and 256-channel layers; other cc
+  12.x GPUs keep the sm80 build. Weights whose Winograd transform would leave the
+  FP16 range keep the direct FP16 kernels. On voxconverse-dev the Cuda run takes
+  24.9 s at 7.01% DER. Layers are grouped by input channels.
 
 Other devices use their kernel defaults. Measured speed evidence is reported,
 but isn't required to select a kernel. GPU-specific builds stay driver-only and
@@ -92,10 +111,26 @@ some individual layers are slower.
 
 ## Tuning
 
-Build the opt-in command on Linux:
+The `speakrs` command in each GitHub release's Linux x86_64 archive (glibc 2.28
+or newer) and Windows x86_64 zip is built with `cuda`, so it writes tune files
+for applications built with `cuda` at the same speakrs version:
 
 ```sh
-cargo build --release --no-default-features --features cuda --bin speakrs
+curl -LSfs https://github.com/avencera/speakrs/releases/latest/download/install.sh | sh
+speakrs cuda tune --dry-run
+speakrs cuda tune
+```
+
+End the first line with `sh -s -- --tag vX.Y.Z` to install another release's
+command. `install.sh` doesn't install the Windows zip; unzip it, then run
+`.\speakrs.exe cuda tune` from the extracted directory, since PowerShell
+doesn't run programs from the current directory by bare name. Without `--models-dir PATH`, the tuner uses the CUDA models in the
+download cache, downloading them first if needed; `--cache-dir DIR` picks
+another cache. For a GPU-specific build, or Linux arm64, build the command with
+your application's CUDA feature:
+
+```sh
+cargo build --release -p speakrs-cli --no-default-features --features cuda-rtx40
 ./target/release/speakrs cuda tune --models-dir /path/to/models --dry-run
 ./target/release/speakrs cuda tune --models-dir /path/to/models
 ```
@@ -144,7 +179,8 @@ Tuning doesn't change accuracy rules or precision.
 ### Tune files
 
 The file is saved under `$XDG_CONFIG_HOME/speakrs/`, or
-`$HOME/.config/speakrs/`, with a per-device name.
+`$HOME/.config/speakrs/` (`%LOCALAPPDATA%\speakrs\` on Windows), with a
+per-device name.
 
 - **Paths:** use `--output PATH` to change that location, then set
   `SPEAKRS_CUDA_TUNE_FILE=PATH` when loading a model. The same variable can set

@@ -28,8 +28,11 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::Arc;
 
-use cudarc::driver::{CudaGraph, CudaSlice, CudaStream, LaunchConfig, PushKernelArg, sys};
+use cudakit::Graph;
+use cudarc::driver::{CudaSlice, CudaStream, LaunchConfig, PushKernelArg, sys};
 use serde_json::json;
+
+use cudakit::dnn::Residual;
 
 use super::super::candidate::{
     ConfigPin, ConvCandidate, ConvInputs, ConvKernel, ConvLayerSpec, ConvOxide, ConvPin,
@@ -38,7 +41,7 @@ use super::super::candidate::{
     WideconvPartition, WideconvProducts, WideconvSplitCells, WideconvTensorKernel, f16_bits,
 };
 use super::super::dnn::ConvPlanner;
-use super::super::geometry::{Conv2d, Residual};
+use super::super::geometry::Conv2d;
 use super::super::implementation::Choice;
 use super::super::kernels::ModuleRequest;
 use super::super::{
@@ -46,6 +49,7 @@ use super::super::{
     SafetensorsFile,
 };
 use super::{reference_dir, runtime};
+use crate::inference::cuda::tier::test_support::TierPolicy;
 
 const B1_MODEL: &str = "wespeaker-multimask-tail";
 const B32_MODEL: &str = "wespeaker-multimask-tail-b32";
@@ -243,21 +247,9 @@ fn items(values: &[f32], items: usize, batch: usize) -> Vec<f32> {
         .collect()
 }
 
-fn capture(
-    stream: &Arc<CudaStream>,
-    mut enqueue: impl FnMut() -> Result<(), CudaError>,
-) -> Result<CudaGraph, CudaError> {
-    stream.synchronize()?;
-    stream.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
-    let enqueued = enqueue();
-    let captured = stream.end_capture(sys::CUgraphInstantiate_flags(0));
-    enqueued?;
-    Ok(captured?.expect("nonempty graph"))
-}
-
 /// Median milliseconds per replay over 10 samples of 10 replays, after 100 ms of
 /// warm-up so the clock settles
-fn timed(graph: &CudaGraph, stream: &CudaStream) -> Result<f64, CudaError> {
+fn timed(graph: &Graph, stream: &CudaStream) -> Result<f64, CudaError> {
     let start = stream.record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))?;
     loop {
         for _ in 0..5 {
@@ -425,7 +417,7 @@ fn trunk_resnet_override_obeys_forced_ptx_jit() -> Result<(), CudaError> {
                 Some(override_name),
                 PtxTier::Sm80,
                 device,
-                |request| request.diagnostic_request(force_jit),
+                |request| Ok(request.diagnostic_request(force_jit)?),
             )?
             .expect("trunk override selects an artifact");
             let artifact = if force_jit {
@@ -646,7 +638,7 @@ impl Library {
     ) -> Result<(), CudaError> {
         if !layer.shortcut {
             let residual_view = residual.map(|value| value.as_view());
-            return self.plan.forward_bias_relu(
+            return Ok(self.plan.forward_bias_relu(
                 &mut self.workspace.as_view_mut(),
                 &x.as_view(),
                 &weight.as_view(),
@@ -658,7 +650,7 @@ impl Library {
                     Residual::Add,
                 ),
                 &mut out.as_view_mut(),
-            );
+            )?);
         }
         self.plan.forward(
             &mut self.workspace.as_view_mut(),
@@ -773,7 +765,8 @@ fn driver_trunk_layers_match_library() -> Result<(), CudaError> {
                 let mut enqueue_library =
                     || library.enqueue(stream, &layer, &xd, &wd, &bd, rd.as_ref(), &mut lib_out);
                 enqueue_library()?;
-                let lib_graph = capture(stream, &mut enqueue_library)?;
+                // SAFETY: the case's buffers are declared before the graph and outlive it
+                let lib_graph = unsafe { runtime.capture_nonempty(&mut enqueue_library) }?;
                 let lib_values = stream.clone_dtoh(&lib_out)?;
                 // cuMemcpyDtoHAsync into pageable memory has no completion guarantee
                 stream.synchronize()?;
@@ -795,7 +788,8 @@ fn driver_trunk_layers_match_library() -> Result<(), CudaError> {
                     )
                 };
                 enqueue()?;
-                let graph = capture(stream, &mut enqueue)?;
+                // SAFETY: the case's buffers are declared before the graph and outlive it
+                let graph = unsafe { runtime.capture_nonempty(&mut enqueue) }?;
                 let eager = stream.clone_dtoh(&out)?;
                 // cuMemcpyDtoHAsync into pageable memory has no completion guarantee
                 stream.synchronize()?;
@@ -1013,14 +1007,23 @@ fn driver_trunk_embedding_matches_library() -> Result<(), CudaError> {
 
 /// The same-channel FP16 shapes whose tiles have [`HalfIo`] launches: channels, input
 /// plane and tiles
-const HALF_SHAPES: [(usize, [usize; 2], WideconvFp16Tiles); 6] = [
+const HALF_SHAPES: [(usize, [usize; 2], WideconvFp16Tiles); 9] = [
     (32, [80, 998], WideconvFp16Tiles::Wide),
     (64, [40, 499], WideconvFp16Tiles::Wide),
+    (64, [40, 499], WideconvFp16Tiles::Winograd),
     (128, [20, 250], WideconvFp16Tiles::Wide),
     (128, [20, 250], WideconvFp16Tiles::Narrow),
+    (128, [20, 250], WideconvFp16Tiles::Winograd),
     (256, [10, 125], WideconvFp16Tiles::Wide),
     (256, [10, 125], WideconvFp16Tiles::Narrow),
+    (256, [10, 125], WideconvFp16Tiles::Winograd),
 ];
+
+/// Whether `tiles` exist in the loaded wideconv variant: FP16 Winograd tiles only in
+/// the sm120 one
+fn tiles_loaded(tiles: WideconvFp16Tiles, tier: PtxTier) -> bool {
+    tiles != WideconvFp16Tiles::Winograd || tier >= PtxTier::Sm120
+}
 
 /// Seeded values uniform in `[-scale, scale)`, from SplitMix64
 fn seeded(seed: u64, len: usize, scale: f32) -> Vec<f32> {
@@ -1170,6 +1173,13 @@ fn forced_fp16_half_launches_match_fp32() -> Result<(), CudaError> {
         output,
     };
     for (shape, &(channels, input, tiles)) in HALF_SHAPES.iter().enumerate() {
+        if !tiles_loaded(tiles, kernels.tier()) {
+            eprintln!(
+                "FP16_HALF c{channels} {tiles:?}: skipped on the {} variant",
+                kernels.tier()
+            );
+            continue;
+        }
         for batch in [2, 3] {
             let conv = Conv2d {
                 batch,
@@ -1213,7 +1223,7 @@ fn forced_fp16_half_launches_match_fp32() -> Result<(), CudaError> {
                     partition: WideconvPartition::Whole,
                     split_cells: WideconvSplitCells::All,
                 };
-                // the FP16 tiles build on every tier, so no device may skip a shape
+                // the direct FP16 tiles build on every tier, so no device may skip them
                 let plan = WideconvOxide::with_config(&runtime, &kernels, spec, config).map_err(
                     |error| CudaError::Unsupported {
                         context: "forced FP16 half plan",
@@ -1329,6 +1339,107 @@ fn forced_fp16_half_launches_match_fp32() -> Result<(), CudaError> {
 
             eprintln!("FP16_HALF {name}: ok");
         }
+    }
+    Ok(())
+}
+
+/// FP16 Winograd tiles against an FP32 kernel on seeded residual-block inputs: their
+/// error stays within a small multiple of the direct FP16 tiles' error, which rounds
+/// the same operands to FP16 before a direct sum
+#[test]
+fn forced_fp16_winograd_error_tracks_direct_fp16() -> Result<(), CudaError> {
+    const TEST: &str = "forced_fp16_winograd_error_tracks_direct_fp16";
+    let Some(runtime) = runtime(TEST) else {
+        return Ok(());
+    };
+    let kernels = runtime.load_module(runtime.embedded_exact_request(KernelModule::Wideconv)?)?;
+    if !tiles_loaded(WideconvFp16Tiles::Winograd, kernels.tier()) {
+        eprintln!(
+            "skipping {TEST}: the {} wideconv variant has no FP16 Winograd tiles",
+            kernels.tier()
+        );
+        return Ok(());
+    }
+    let stream = runtime.stream();
+    // the 64-channel shape has no spatial tiles, so its FP32 Winograd kernel is the
+    // reference; its error sits far below FP16 rounding
+    let fp32_winograd = WideconvAlgorithm::Winograd(WideconvProducts::Fp32);
+    for (channels, input, exact) in [
+        (64, [40, 499], fp32_winograd),
+        (128, [20, 250], WideconvAlgorithm::Spatial),
+        (256, [10, 125], WideconvAlgorithm::Spatial),
+    ] {
+        let batch = 3;
+        let conv = |math| Conv2d {
+            batch,
+            in_channels: channels,
+            out_channels: channels,
+            input,
+            kernel: [3, 3],
+            padding: [1, 1],
+            stride: [1, 1],
+            dilation: [1, 1],
+            math,
+        };
+        let len = conv(CudaMath::Fp32)
+            .output_shape()
+            .iter()
+            .product::<usize>();
+        let seed = 7 * channels as u64;
+        let scale = (3.0 / (9 * channels) as f32).sqrt();
+        let x = stream.clone_htod(&seeded(seed, len, 2.0))?;
+        let residual = stream.clone_htod(&seeded(seed + 1, len, 2.0))?;
+        let bias = stream.clone_htod(&seeded(seed + 2, channels, 0.1))?;
+        let weight = stream.clone_htod(&seeded(seed + 3, channels * channels * 9, scale))?;
+        let run = |math, algorithm| -> Result<Vec<f32>, CudaError> {
+            let name = format!("c{channels} {algorithm:?}");
+            let spec = ConvLayerSpec {
+                name: &name,
+                conv: conv(math),
+                epilogue: Epilogue::BiasReluResidual,
+                weight: &weight,
+                bias: &bias,
+            };
+            let config = WideconvConfig {
+                algorithm,
+                partition: WideconvPartition::Whole,
+                split_cells: WideconvSplitCells::All,
+            };
+            let plan =
+                WideconvOxide::with_config(&runtime, &kernels, spec, config).map_err(|error| {
+                    CudaError::Unsupported {
+                        context: "forced FP16 Winograd error plan",
+                        reason: format!("{name}: {error}"),
+                    }
+                })?;
+            let layer = HalfLayer {
+                plan,
+                weight: weight.clone(),
+                len,
+            };
+            let (values, saturated) =
+                layer.run(stream, &bias, &x, Some(&residual), HalfIo::FP32)?;
+            assert!(!saturated, "{name}: set the range word");
+            Ok(values)
+        };
+        let reference = run(CudaMath::Fp32, exact)?;
+        let direct = run(
+            CudaMath::Tf32,
+            WideconvAlgorithm::Fp16(WideconvFp16Tiles::Wide),
+        )?;
+        let winograd = run(
+            CudaMath::Tf32,
+            WideconvAlgorithm::Fp16(WideconvFp16Tiles::Winograd),
+        )?;
+        let (direct_max, direct_rms) = difference(&direct, &reference);
+        let (winograd_max, winograd_rms) = difference(&winograd, &reference);
+        eprintln!(
+            "FP16_WINOGRAD c{channels}: direct max {direct_max:.3e} rms {direct_rms:.3e}, winograd max {winograd_max:.3e} rms {winograd_rms:.3e}"
+        );
+        assert!(
+            winograd_rms <= 3.0 * direct_rms && winograd_max <= 4.0 * direct_max,
+            "c{channels}: FP16 Winograd error {winograd_max:.3e} max {winograd_rms:.3e} rms against direct {direct_max:.3e} max {direct_rms:.3e} rms"
+        );
     }
     Ok(())
 }

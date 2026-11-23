@@ -11,6 +11,7 @@ pip install speakrs
 | --- | --- |
 | macOS arm64 | `CPU`, `CoreML`, `CoreMLFast` |
 | Linux x86_64 (glibc 2.28+) | `CPU`, `CUDA`, `CUDAFast` |
+| Windows x86_64 | `CPU`, `CUDA`, `CUDAFast` |
 
 The package needs Python 3.11 or newer. One wheel covers every Python version.
 
@@ -48,15 +49,50 @@ The command line prints RTTM:
 speakrs diarize meeting.wav --mode coreml
 ```
 
+To install only the command line, in its own environment, use
+[uv](https://docs.astral.sh/uv/):
+
+```sh
+uv tool install speakrs
+```
+
 See [API.md](https://github.com/avencera/speakrs/blob/master/crates/speakrs-python/API.md)
 for the full API: the queue, async methods, configuration, progress events,
 cancellation, and error categories.
 
+## Example: a transcript with speakers
+
+[`examples/transcribe.py`](https://github.com/avencera/speakrs/blob/master/crates/speakrs-python/examples/transcribe.py)
+combines speakrs with [faster-whisper](https://github.com/SYSTRAN/faster-whisper)
+to write a transcript that says who said what. It runs diarization and
+transcription at the same time and gives each word to the speaker talking
+at that moment. uv can run it straight from GitHub:
+
+```sh
+uv run https://raw.githubusercontent.com/avencera/speakrs/master/crates/speakrs-python/examples/transcribe.py meeting.mp3
+```
+
+```
+[06:31] Speaker 2: Crocodile?
+
+[06:34] Speaker 5: Yeah, it can be a crocodile. It can be a crocodile. Firstly, it was an attempt at a T-rex, and then it sort of changed into a pelican, but it can be a crocodile.
+
+[06:59] Speaker 1: That's lovely.
+```
+
+speakrs diarizes a 17-minute meeting in 0.6 seconds on an RTX 5090 and in
+under 5 seconds on an M4 Pro in CoreML mode, so whisper takes almost all of
+the time. The script picks CoreML
+on macOS and CUDA on Linux when it finds an NVIDIA GPU, falling back to the
+CPU when that GPU is older than Turing; `--mode` overrides that, and
+`--whisper-model turbo` gives a better transcript.
+
 ## CUDA
 
-The Linux wheel includes the CUDA backend. It needs an NVIDIA driver and a
-Turing (RTX 20, T4) or newer GPU, but no CUDA toolkit. On a machine without a
-GPU, the wheel still imports and runs on the CPU.
+The Linux and Windows wheels include the CUDA backend. It needs an NVIDIA
+driver and a Turing (RTX 20, T4) or newer GPU, but no CUDA toolkit. On a
+machine without a GPU, the wheel still imports and runs on the CPU. The
+Windows wheel passes CI but hasn't run on a GPU yet.
 
 speakrs runs its own kernels for every layer. cuDNN 9 and cuBLAS are only a
 fallback for a layer that has no kernel for your GPU. If you want that
@@ -66,11 +102,17 @@ fallback, install it with:
 pip install "speakrs[cuda]"
 ```
 
+The extra installs the `nvidia-cudnn-cu12` and `nvidia-cublas-cu12` wheels,
+which speakrs loads from site-packages on Linux and Windows. Leave it out if
+cuDNN 9 and cuBLAS 12 are already on the library path (on Windows, an absolute
+`PATH` entry or `%CUDA_PATH%\bin`).
+
 ## Models
 
 `prepare()` and `from_pretrained()` download the models from the
 [`avencera/speakrs-models`](https://huggingface.co/avencera/speakrs-models)
 Hugging Face repository. They go into the Hugging Face hub cache, which is set
-by `SPEAKRS_CACHE_DIR` or `HF_HOME`.
+by `SPEAKRS_CACHE_DIR`, `HF_HUB_CACHE` or `HF_HOME`. A token in `HF_TOKEN`, or
+saved by `hf auth login`, is sent with downloads.
 
 To skip the download, pass `model_dir=` to use a local directory instead.

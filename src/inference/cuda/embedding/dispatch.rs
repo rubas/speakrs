@@ -109,7 +109,7 @@ impl Convs<'_> {
                     x,
                     &layer.weight().data().as_view(),
                     &layer.bias().data().as_view(),
-                    residual,
+                    residual.library(),
                     y,
                 )?;
 
@@ -244,10 +244,7 @@ pub(super) fn plan_layers(
     let mut planner = None;
     let mut plans = Vec::new();
     for (layer, residual) in trunk.layers() {
-        let layer_fp16 = match fp16 {
-            Fp16Policy::Allowed => layer.fp16(),
-            Fp16Policy::Excluded => Fp16Policy::Excluded,
-        };
+        let layer_fp16 = fp16.and(layer.fp16());
         let selected = plan_selection_with(
             runtime,
             layer.boundary(),

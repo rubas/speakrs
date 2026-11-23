@@ -215,14 +215,12 @@ impl Dataset {
 
 impl Source {
     fn try_tigris(&self) -> bool {
-        if matches!(self, Self::VoxConverseDev) {
-            return false;
-        }
         #[cfg(test)]
         if matches!(self, Self::Local { .. }) {
             return false;
         }
-        true
+
+        !matches!(self, Self::VoxConverseDev)
     }
 
     fn provenance(&self, dataset_id: &str) -> String {
@@ -483,12 +481,14 @@ fn publish_staging_directory(staging: &Path, final_dir: &Path, dataset_id: &str)
 }
 
 fn copy_directory_contents(source: &Path, destination: &Path) -> Result<()> {
+    // read_dir order depends on the filesystem (NTFS lists by name), so a file can
+    // come before any subdirectory whose creation would have made the destination
+    fs::create_dir_all(destination)?;
     for entry in fs::read_dir(source)? {
         let entry = entry?;
         let source_path = entry.path();
         let destination_path = destination.join(entry.file_name());
         if source_path.is_dir() {
-            fs::create_dir_all(&destination_path)?;
             copy_directory_contents(&source_path, &destination_path)?;
         } else {
             fs::copy(&source_path, destination_path)?;

@@ -15,7 +15,7 @@ pub(crate) mod segmentation;
 
 use std::fmt;
 
-pub use embedding::EmbeddingModel;
+pub use embedding::{EmbeddingModel, MaskedEmbeddingInput};
 pub use error::{ExecutionModeError, InferenceError, ModelLoadError};
 pub use geometry::TensorShapeError;
 #[cfg(any(feature = "cpu", feature = "_cuda"))]
@@ -23,7 +23,10 @@ pub use native_model::NativeWeightsError;
 #[cfg(feature = "_ort")]
 pub use ort_runtime::{DynamicRuntimeError, OrtRuntimeError, with_execution_mode};
 #[cfg(feature = "migraphx")]
-pub(crate) use ort_runtime::{OrtProvider, SharedSession, ensure_ort_ready};
+pub(crate) use ort_runtime::{OrtProvider, SharedSession};
+#[cfg(feature = "migraphx")]
+#[cfg_attr(docsrs, doc(cfg(feature = "migraphx")))]
+pub use ort_runtime::{ort_environment, use_ort_environment};
 pub use segmentation::{SegmentationError, SegmentationModel};
 
 #[cfg(feature = "coreml")]
@@ -65,6 +68,47 @@ impl CoreMlComputeUnits {
     }
 }
 
+/// Largest batch the CoreML segmentation model runs per prediction
+///
+/// A smaller batch lowers peak memory, and the models for larger batches are not loaded. On
+/// three AMI meetings in [`ExecutionMode::CoreMl`] on an M2 Pro, peak RSS fell from
+/// 3.7–4.6 GB at [`Self::Batch64`] to 1.4–1.6 GB at [`Self::Single`], with about the same
+/// speed and the same DER
+///
+/// Recordings shorter than 192 windows, about three minutes in [`ExecutionMode::CoreMl`],
+/// run one window per prediction in the pipeline whichever batch is chosen
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CoreMlSegmentationBatch {
+    /// One window per prediction, which loads only the single-window model
+    Single,
+    /// Up to 32 windows per prediction
+    Batch32,
+    /// Up to 64 windows per prediction (default)
+    #[default]
+    Batch64,
+}
+
+impl CoreMlSegmentationBatch {
+    /// Windows per prediction for this choice
+    pub const fn size(self) -> usize {
+        match self {
+            Self::Single => 1,
+            Self::Batch32 => 32,
+            Self::Batch64 => 64,
+        }
+    }
+
+    /// The choice that runs `size` windows per prediction, if it is 1, 32 or 64
+    pub const fn from_size(size: usize) -> Option<Self> {
+        match size {
+            1 => Some(Self::Single),
+            32 => Some(Self::Batch32),
+            64 => Some(Self::Batch64),
+            _ => None,
+        }
+    }
+}
+
 /// Which backend and acceleration to use for inference
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -75,7 +119,7 @@ pub enum ExecutionMode {
     /// Native CoreML with FP32 precision and ~1s step
     #[cfg_attr(docsrs, doc(cfg(feature = "coreml")))]
     CoreMl,
-    /// Native CoreML with W8A16 segmentation and ~2s step
+    /// Native CoreML with FP32 precision and ~2s step
     #[cfg_attr(docsrs, doc(cfg(feature = "coreml")))]
     CoreMlFast,
     /// Native NVIDIA GPU backend (cuBLAS, cuDNN and custom kernels, no ONNX Runtime)

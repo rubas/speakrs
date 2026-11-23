@@ -8,6 +8,7 @@ on:
   pull_request:
     branches:
       - master
+      - update-crates
 
 permissions:
   contents: read
@@ -25,8 +26,8 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install Rust 1.89
-        uses: dtolnay/rust-toolchain@1.89
+      - name: Install Rust 1.96
+        uses: dtolnay/rust-toolchain@1.96
 
       # a prebuilt binary instead of cargo-deny-action, whose Docker build fails
       # whenever Docker Hub rate-limits or times out the runner
@@ -39,13 +40,13 @@ jobs:
         run: cargo deny --no-default-features --features online,cpu,cuda,migraphx,load-dynamic,_metrics check
 
   msrv:
-    name: MSRV Rust 1.89
+    name: MSRV Rust 1.96
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install Rust 1.89
-        uses: dtolnay/rust-toolchain@1.89
+      - name: Install Rust 1.96
+        uses: dtolnay/rust-toolchain@1.96
 
       - name: Cache Rust builds
         uses: Swatinem/rust-cache@v2
@@ -71,6 +72,10 @@ jobs:
           - name: macOS arm64
             os: macos-15
             features: cpu coreml cuda migraphx load-dynamic _metrics
+          # CUDA loads at run time, so the Windows build needs no toolkit
+          - name: Windows x86_64
+            os: windows-2025
+            features: cpu cuda migraphx load-dynamic _metrics
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
@@ -107,7 +112,7 @@ jobs:
       - name: Check the CPU backend alone
         run: cargo check -p speakrs --no-default-features --features "online cpu"
 
-      - name: Keep ONNX Runtime out of CPU dependency trees
+      - name: Keep ONNX Runtime and CUDA out of CPU and CoreML dependency trees
         run: bash scripts/check_cpu_dependencies.sh
 
       - name: Require a backend feature
@@ -223,8 +228,8 @@ jobs:
             cargo check -p speakrs --no-default-features --features "$features"
             cargo test -p speakrs --no-default-features --features "$features" --lib inference::cuda::tier::tests
             cargo test -p speakrs --no-default-features --features "$features" --lib inference::cuda::kernels::tests
-            cargo tree -p speakrs --no-default-features --features "$features" -e features -i cudarc > cuda-features.log
-            if grep -E 'cudarc feature "(cublas|cudnn)"' cuda-features.log; then
+            cargo tree -p speakrs --no-default-features --features "$features" -e features -i cudakit-cudarc > cuda-features.log
+            if grep -E 'cudakit-cudarc feature "(cublas|cublaslt|cudnn)"' cuda-features.log; then
               echo "optional CUDA library feature in a minimal backend" >&2
               exit 1
             fi
@@ -270,7 +275,8 @@ jobs:
         run: cargo clippy -p speakrs --all-targets --no-default-features --features "online coreml" -- -D warnings
 
   test:
-    timeout-minutes: 30
+    # the Windows leg builds a second, CUDA-only test binary, and MSVC links slower
+    timeout-minutes: ${{ matrix.os == 'windows-2025' && 45 || 30 }}
     name: Test (${{ matrix.name }})
     strategy:
       fail-fast: false
@@ -282,6 +288,8 @@ jobs:
             os: ubuntu-24.04-arm
           - name: macOS arm64
             os: macos-15
+          - name: Windows x86_64
+            os: windows-2025
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
@@ -335,6 +343,12 @@ jobs:
       # the package workflow, so leave it out of the CPU fixture test run
       - name: Run tests
         run: cargo test --workspace --exclude speakrs-python
+
+      # the cuda-only job covers Linux; this runs the same host-only CUDA tests, and
+      # builds the GPU ones, against the Windows loader and paths
+      - name: Run host-only CUDA tests
+        if: runner.os == 'Windows'
+        run: cargo test -p speakrs --no-default-features --features "online cuda"
 
       # hashes and PTX entry points only; the PTX itself is generated on a GPU box
       - name: Check committed CUDA PTX against the kernel sources

@@ -1,15 +1,17 @@
 //! Host routing proofs without a CUDA context or an optional library
 
+use cudakit::{DeviceAttributes, DeviceAttributesBuilder as Builder};
+
 use super::{Area, select_from};
 use crate::inference::cuda::candidate::{
     Batches, ConfigPin, Coverage, CoverageEntry, DriverCandidate, Fp16Policy, Maths, PlanError,
     SincPin,
 };
-use crate::inference::cuda::device::{DeviceAttributes, test_support::Builder};
 use crate::inference::cuda::implementation::{
     BoundaryId, Modules, PlanPin, PlanRequest, Selected, TokenEvidence,
 };
 use crate::inference::cuda::kernels::ModuleRequest;
+use crate::inference::cuda::tier::test_support::BuildTiers;
 use crate::inference::cuda::{ComputeCapability, CudaError, CudaMath, KernelModule, PtxTier};
 
 struct Fixture {
@@ -67,7 +69,7 @@ impl Modules for &mut Fixture {
     }
 
     fn effective_request(&self, request: ModuleRequest) -> Result<ModuleRequest, CudaError> {
-        request.diagnostic_request(self.force_jit)
+        Ok(request.diagnostic_request(self.force_jit)?)
     }
 
     fn device(&self) -> &DeviceAttributes {
@@ -900,7 +902,7 @@ fn measured_a100_recipe_uses_class_defaults_for_every_pipeline_boundary() {
                     panic!("driver boundary")
                 };
                 assert_eq!(hybrid.pin, driver.pin, "{name} {boundary} b{batch}");
-                if let Some(fp16) = recipe.fp16_pin(boundary, batch, math) {
+                if let Some(fp16) = recipe.fp16_pin(boundary, batch, math, Fp16Policy::Allowed) {
                     assert_eq!(driver.pin, super::super::PlanPin::Pinned(fp16));
                 }
                 assert_eq!(hybrid.target, driver.target);
@@ -2336,13 +2338,7 @@ fn target_only_tf32_segmentation_selects_every_stage_boundary() {
         (ComputeCapability::new(9, 0), PtxTier::Sm90, 227328),
         (ComputeCapability::new(12, 0), PtxTier::Sm120, 101376),
     ] {
-        let compiled = match tier {
-            PtxTier::Sm75 => cfg!(feature = "cuda-sm75"),
-            PtxTier::Sm80 => cfg!(feature = "cuda-sm80"),
-            PtxTier::Sm90 => cfg!(feature = "cuda-sm90"),
-            PtxTier::Sm120 => cfg!(feature = "cuda-sm120"),
-        };
-        if !compiled {
+        if !tier.is_compiled_in() {
             continue;
         }
 

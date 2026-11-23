@@ -4,12 +4,12 @@ use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+use cudakit::DeviceAttributes;
+use cudakit::identity::DriverRelease;
 use serde::{Deserialize, Serialize};
 
-use super::driver_version::DriverRelease;
 use super::{ApprovedChoice, Catalogue, LibraryVersions, Tuple};
 use crate::inference::cuda::CudaMath;
-use crate::inference::cuda::device::DeviceAttributes;
 
 const FORMAT_VERSION: u32 = 4;
 const MAX_FILE_BYTES: u64 = 4 << 20;
@@ -244,6 +244,21 @@ pub(super) fn read(path: &Path) -> Result<Option<TuneFile>, FileError> {
     Ok(Some(serde_json::from_value(value)?))
 }
 
+/// The per-user config directory when `XDG_CONFIG_HOME` is unset
+#[cfg(not(windows))]
+fn default_config_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config"))
+}
+
+/// The per-user config directory when `XDG_CONFIG_HOME` is unset
+///
+/// Windows sets no `HOME`. Measurements belong to this machine's GPU, so they go in the
+/// local profile, not the one that roams to other machines
+#[cfg(windows)]
+fn default_config_dir() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
+}
+
 /// The path is stable across upgrades, while the key invalidates old measurements
 pub(super) fn path(
     device: &DeviceAttributes,
@@ -257,7 +272,7 @@ pub(super) fn path(
     }
     let root = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+        .or_else(default_config_dir)
         .ok_or_else(|| {
             FileError::Invalid("set SPEAKRS_CUDA_TUNE_FILE or XDG_CONFIG_HOME".into())
         })?;

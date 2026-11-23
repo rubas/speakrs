@@ -16,16 +16,16 @@
 //!
 //! ```toml
 //! # macOS (CoreML)
-//! speakrs = { version = "0.7", features = ["coreml"] }
+//! speakrs = { version = "0.8", features = ["coreml"] }
 //!
 //! # NVIDIA GPU
-//! speakrs = { version = "0.7", features = ["cuda"] }
+//! speakrs = { version = "0.8", features = ["cuda"] }
 //!
 //! # CPU
-//! speakrs = { version = "0.7", features = ["cpu"] }
+//! speakrs = { version = "0.8", features = ["cpu"] }
 //!
 //! # AMD GPU
-//! speakrs = { version = "0.7", features = ["migraphx"] }
+//! speakrs = { version = "0.8", features = ["migraphx"] }
 //! ```
 //!
 //! The `cpu`, `coreml` and `cuda` features run native backends, so a build with only those
@@ -133,9 +133,46 @@
 //! print(pipeline.diarize_file("meeting.wav").rttm())
 //! ```
 //!
-//! The macOS arm64 wheel includes CPU and CoreML, and the Linux x86_64 wheel
-//! includes CPU and CUDA. See [the Python package](https://github.com/avencera/speakrs/blob/master/crates/speakrs-python/README.md)
+//! For the `speakrs diarize` command line alone, `uv tool install speakrs`
+//! installs it in its own environment.
+//!
+//! The macOS arm64 wheel includes CPU and CoreML, and the Linux x86_64 and Windows
+//! x86_64 wheels include CPU and CUDA. See [the Python package](https://github.com/avencera/speakrs/blob/master/crates/speakrs-python/README.md)
 //! and its [API reference](https://github.com/avencera/speakrs/blob/master/crates/speakrs-python/API.md).
+//!
+//! ## Command line
+//!
+//! The `speakrs` command diarizes audio files and prints RTTM, with no Python. Each
+//! GitHub release has it for Linux x86_64 with CPU and CUDA, Linux arm64 with CPU,
+//! Apple silicon with CPU and CoreML, and Windows x86_64 with CPU and CUDA. On Linux
+//! and macOS, this installs the latest release into `~/.local/bin`:
+//!
+//! ```sh
+//! curl -LSfs https://github.com/avencera/speakrs/releases/latest/download/install.sh | sh
+//! speakrs diarize meeting.wav > meeting.rttm
+//! ```
+//!
+//! Add `--mode coreml` on a Mac or `--mode cuda` on an NVIDIA GPU.
+//!
+//! It reads WAV, FLAC, MP3, Ogg and M4A, and downloads the mode's models into the
+//! Hugging Face cache on first use. It takes the same options as the Python
+//! package's `speakrs diarize`: `--mode` (default `cpu`), `--model-dir`,
+//! `--cache-dir`, `--file-id` and `--exclusive`. Several files run as one overlapped
+//! batch. Each file's RTTM id is its name without the extension, with whitespace
+//! replaced by `_`, since RTTM fields are separated by spaces. The Linux binaries need glibc 2.28 or newer, and the CUDA modes need an
+//! NVIDIA driver. To pick another release or install directory, end the first line
+//! with `sh -s -- --tag vX.Y.Z --to DIR`.
+//!
+//! On Windows, download `speakrs-<tag>-x86_64-pc-windows-msvc.zip` and its `.sha256`
+//! from the [latest release](https://github.com/avencera/speakrs/releases/latest), and
+//! put the `speakrs.exe` inside in a directory on `PATH`. It needs no Visual C++
+//! redistributable. The Windows build passes CI but hasn't run on a GPU yet.
+//!
+//! To build it from source with the backends you want:
+//!
+//! ```sh
+//! cargo install --git https://github.com/avencera/speakrs speakrs-cli --features coreml
+//! ```
 //!
 //! # Choosing a mode
 //!
@@ -163,18 +200,22 @@
 //!
 //! # Benchmarks
 //!
-//! On VoxConverse dev on an RTX 4090, speakrs `cuda` is about 56 times faster than
-//! an earlier pyannote CUDA run, with 7.0% versus 7.2% DER. `cuda-fast` is about 105
+//! On VoxConverse dev on an RTX 4090, speakrs `cuda` is about 60 times faster than
+//! an earlier pyannote CUDA run, with 7.0% versus 7.2% DER. `cuda-fast` is about 115
 //! times faster, with 7.4% DER.
-//! On an RTX 4090, an hour of audio takes about 2.0 seconds with `cuda` and
-//! 1.1 seconds with `cuda-fast`. On an Apple M4 Pro with CoreML it takes about 7 seconds.
+//! On an RTX 4090, an hour of audio takes about 1.9 seconds with `cuda` and
+//! 1.0 second with `cuda-fast`. On an RTX 5090 it takes about 1.2 seconds with
+//! `cuda` and 0.6 seconds with `cuda-fast`. On an Apple M4 Pro with CoreML it takes
+//! about 7 seconds.
 //!
 //! VoxConverse dev, collar=0ms:
 //!
 //! | Platform | Implementation | DER | Time | RTFx |
 //! |----------|----------------|-----|------|------|
-//! | RTX 4090 | `speakrs` `cuda` | **7.0%** | 40.9s | 1786x |
-//! | RTX 4090 | `speakrs` `cuda-fast` | 7.4% | 22.0s | **3325x** |
+//! | RTX 4090 | `speakrs` `cuda` | **7.0%** | 38.2s | 1912x |
+//! | RTX 4090 | `speakrs` `cuda-fast` | 7.4% | 20.0s | **3646x** |
+//! | RTX 5090 | `speakrs` `cuda` | **7.0%** | 25.0s | 2922x |
+//! | RTX 5090 | `speakrs` `cuda-fast` | 7.4% | 13.0s | **5633x** |
 //! | RTX 4090 | pyannote community-1 (CUDA) | 7.2% | 2301.3s | 32x |
 //! | Apple M4 Pro | `speakrs` `coreml` | **7.1%** | 138s | **529x** |
 //! | Apple M4 Pro | `speakrs` `coreml-fast` | 7.4% | 169s | 434x |
@@ -187,29 +228,34 @@
 //! cloud host doesn't report the CPU model), 8 GiB of RAM and NVIDIA driver
 //! 580.126.18. Their times are the median of 3 runs. The pyannote row ran earlier in
 //! a container with the same GPU, CPU count, RAM and driver, so the speedups compare
-//! separate runs. The speakrs CUDA timings use the batch API,
+//! separate runs. The RTX 5090 rows ran on an Intel Core Ultra 7 270K Plus with
+//! 24 CPU cores, 57 GiB of RAM and driver 595.99.02, also the median of 3 runs.
+//! The speakrs CUDA timings use the batch API,
 //! [`OwnedDiarizationPipeline::run_batch_stream`], with WAV files decoded on worker
 //! threads ahead of it; it clusters each finished file while the GPU runs the next.
 //!
-//! ## All datasets on an RTX 4090
+//! ## All datasets on an RTX 4090 and RTX 5090
 //!
-//! | Dataset | Audio | `cuda` DER | `cuda` RTFx | `cuda-fast` DER | `cuda-fast` RTFx |
-//! |---|---:|---:|---:|---:|---:|
-//! | VoxConverse dev | 20.3 h | 7.0% | 1786x | 7.4% | 3325x |
-//! | VoxConverse test | 43.5 h | 11.1% | 1921x | 11.2% | 3722x |
-//! | AMI IHM | 18.7 h | 17.0% | 1955x | 17.4% | 3796x |
-//! | AMI SDM | 18.7 h | 19.7% | 1874x | 20.6% | 3665x |
-//! | AISHELL-4 | 12.7 h | 11.1% | 1916x | 11.4% | 3706x |
-//! | Earnings-21 | 39.3 h | 9.7% | 1864x | 9.2% | 3578x |
-//! | ICSI | 71.7 h | 33.3% | 1814x | 33.7% | 3628x |
-//! | AVA-AVD | 4.4 h | 45.4% | 2083x | 48.9% | 3899x |
+//! Both GPUs score the same DER on every dataset.
 //!
-//! That's about 229 hours of audio in under 8 minutes with `cuda`, or under 4
-//! minutes with `cuda-fast`. The VoxConverse dev row comes from the runs above;
-//! the other rows are single runs of the same version on RTX 4090 containers with
-//! 16 CPU cores and 8 GiB of RAM.
+//! | Dataset | Audio | `cuda` DER | `cuda` 4090 | `cuda` 5090 | `cuda-fast` DER | `cuda-fast` 4090 | `cuda-fast` 5090 |
+//! |---|---:|---:|---:|---:|---:|---:|---:|
+//! | VoxConverse dev | 20.3 h | 7.0% | 1912x | 2922x | 7.4% | 3646x | 5633x |
+//! | VoxConverse test | 43.5 h | 11.1% | 1859x | 2888x | 11.2% | 3618x | 5678x |
+//! | AMI IHM | 18.7 h | 17.0% | 1909x | 2919x | 17.4% | 3563x | 5791x |
+//! | AMI SDM | 18.7 h | 19.7% | 1791x | 2927x | 20.6% | 3754x | 5838x |
+//! | AISHELL-4 | 12.7 h | 11.1% | 1866x | 2844x | 11.4% | 3534x | 5621x |
+//! | Earnings-21 | 39.3 h | 9.7% | 1876x | 2864x | 9.2% | 3613x | 5667x |
+//! | ICSI | 71.7 h | 33.3% | 1937x | 2888x | 33.7% | 3708x | 5725x |
+//! | AVA-AVD | 4.4 h | 45.4% | 2075x | 3095x | 48.9% | 3927x | 5971x |
+//!
+//! That's about 229 hours of audio in under 8 minutes with `cuda` on the RTX 4090,
+//! or under 4 minutes with `cuda-fast`. The RTX 5090 takes under 5 minutes with
+//! `cuda` and under 2.5 minutes with `cuda-fast`. The VoxConverse dev rows come
+//! from the runs above; the other rows are single runs of the same version, on RTX
+//! 4090 containers with 16 CPU cores and 8 GiB of RAM, and on the RTX 5090 machine.
 //! On VoxConverse test, `cuda` and pyannote CUDA both score 11.1% DER; pyannote
-//! ran at 25x in an earlier container, about 78 times slower than `cuda`. On AMI
+//! ran at 25x in an earlier container, about 75 times slower than `cuda`. On AMI
 //! IHM and Earnings-21, `cuda` matches the earlier pyannote runs at 17.0% and 9.7% DER,
 //! where pyannote ran at 15x and 18x. On macOS, `coreml` runs these datasets at
 //! 450x to 644x, with DER within 1.6 points of pyannote's. See
@@ -299,19 +345,19 @@
 //! |---|---|---|
 //! | macOS | `coreml` | Native CoreML, no ONNX Runtime |
 //! | Any CPU | `cpu` | Native Rust, no ONNX Runtime |
-//! | Linux with an NVIDIA GPU | `cuda`, or a GPU-specific feature below | Native CUDA, no ONNX Runtime or CUDA toolkit |
+//! | Linux or Windows with an NVIDIA GPU | `cuda`, or a GPU-specific feature below | Native CUDA, no ONNX Runtime or CUDA toolkit |
 //! | Linux with an AMD GPU | `migraphx` | ONNX Runtime MIGraphX; add `load-dynamic` |
 //!
 //! The default `online` feature downloads models with `ModelManager`.
 //! `load-dynamic` loads ONNX Runtime at run time for `migraphx` or the external ONNX
 //! session helper. The native CPU backend doesn't need it. The ONNX Runtime
-//! dependency (`ort` 2.0.0-rc.13) is still a pre-release.
+//! dependency (`ort` 2.0.0-rc.15) is still a pre-release.
 //!
 //! ## NVIDIA GPUs
 //!
-//! The CUDA backend runs speakrs's own GPU kernels on Linux. It works on any NVIDIA
-//! GPU from the RTX 20 series and T4 onward, and you don't need the CUDA toolkit to
-//! build or run it.
+//! The CUDA backend runs speakrs's own GPU kernels on Linux and Windows (x86_64). It
+//! works on any NVIDIA GPU from the RTX 20 series and T4 onward, and you don't need
+//! the CUDA toolkit to build or run it.
 //!
 //! **Not sure which GPU you'll run on? Use `cuda`.** It includes kernels for every
 //! supported GPU generation. It can also fall back to cuDNN 9 and cuBLAS 12 for a
@@ -319,7 +365,7 @@
 //! below every layer has a kernel, so the libraries aren't loaded.
 //!
 //! ```toml
-//! speakrs = { version = "0.7", features = ["cuda"] }
+//! speakrs = { version = "0.8", features = ["cuda"] }
 //! ```
 //!
 //! **Know your GPU? Use its feature for fewer dependencies and a smaller install.**
@@ -339,8 +385,16 @@
 //! | RTX 50 series | `cuda-rtx50` |
 //!
 //! ```toml
-//! speakrs = { version = "0.7", features = ["cuda-rtx40"] }
+//! speakrs = { version = "0.8", features = ["cuda-rtx40"] }
 //! ```
+//!
+//! On Windows the driver is `nvcuda.dll` from System32, and the `cuda` fallback opens
+//! `cudnn64_9.dll`, `cublas64_12.dll` (with `cublasLt64_12.dll` beside it) and
+//! `nvrtc64_120_0.dll`. It looks for them beside the executable, in System32, in each
+//! absolute `PATH` entry and in `%CUDA_PATH%\bin`, where a CUDA 12 toolkit keeps cuBLAS
+//! and NVRTC, but never in the current directory. Put cuDNN's directory on `PATH`, or
+//! use the Python package, whose `cuda` extra brings its own. CUDA on Windows builds
+//! and passes its host-only tests in CI, but it hasn't run on a GPU yet.
 //!
 //! ### Tested NVIDIA GPUs
 //!
@@ -350,14 +404,16 @@
 //!
 //! | GPU | `cuda` | GPU-specific build |
 //! |---|---:|---:|
-//! | T4 | 294x | 294x |
-//! | A10 | 432x | 436x |
-//! | L4 | 310x | 312x |
-//! | A100 40 GB | 1296x | 1296x |
-//! | RTX 4090 | 1453x | 1438x |
+//! | T4 | **294x** | **294x** |
+//! | A10 | 432x | **436x** |
+//! | L4 | 310x | **312x** |
+//! | A100 40 GB | **1296x** | **1296x** |
+//! | RTX 4090 | **1453x** | 1438x |
+//! | RTX 5090 | 2500x | **2501x** |
 //!
-//! Every run had 16 CPU cores, and each value is the median of 3 runs. The RTX 4060
-//! Ti and RTX 5060 Ti also have tuned kernel profiles. In an earlier version, on the
+//! Every run had 16 CPU cores, and each value is the median of 3 runs. The RTX 5090
+//! row comes from a later version than the others. The RTX 4060 Ti and RTX 5060 Ti
+//! also have tuned kernel profiles. In an earlier version, on the
 //! same subset, speakrs's own kernels were 1.4x to 2.0x faster than cuDNN and cuBLAS
 //! on the RTX 4090, L4, A10 and H100. See [benchmarks/](https://github.com/avencera/speakrs/tree/master/benchmarks)
 //! for full results across all datasets.
@@ -366,12 +422,21 @@
 //!
 //! GPUs without a built-in profile use good defaults. To get the best speed on
 //! yours, run the tuner once. It measures the kernels on your GPU and saves the
-//! fastest choices, which later runs load automatically. Build the tuner with the
-//! same CUDA feature as your application, because a tune file only applies to the
-//! build that wrote it:
+//! fastest choices, which later runs load automatically. A tune file only applies
+//! to the speakrs version and CUDA feature that wrote it. For an application built
+//! with `cuda`, use the Linux x86_64 or Windows x86_64 [`speakrs` command](#command-line)
+//! from the matching GitHub release, which is built with `cuda`:
 //!
 //! ```sh
-//! cargo build --release --no-default-features --features cuda-rtx40 --bin speakrs
+//! speakrs cuda tune
+//! ```
+//!
+//! Without `--models-dir`, it tunes with the CUDA models from the download cache,
+//! downloading them first if needed. For a GPU-specific build, build the command
+//! with the same feature as your application:
+//!
+//! ```sh
+//! cargo build --release -p speakrs-cli --no-default-features --features cuda-rtx40
 //! ./target/release/speakrs cuda tune --models-dir /path/to/models
 //! ```
 //!
@@ -457,8 +522,14 @@ pub mod segment;
 pub(crate) mod utils;
 
 // crate-root re-exports for the main import path
+#[cfg(feature = "online")]
+#[cfg_attr(docsrs, doc(cfg(feature = "online")))]
 #[cfg(feature = "_backend")]
-pub use inference::{CoreMlComputeUnits, ExecutionMode};
+pub use hf_fetch::HubError;
+#[cfg(feature = "_backend")]
+pub use hf_fetch::default_hub_cache_dir;
+#[cfg(feature = "_backend")]
+pub use inference::{CoreMlComputeUnits, CoreMlSegmentationBatch, ExecutionMode};
 #[cfg(feature = "_backend")]
 pub use models::ModelBundle;
 #[cfg(feature = "online")]

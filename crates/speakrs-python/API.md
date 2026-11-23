@@ -26,7 +26,7 @@ names `CUDAFast`.
 | --- | --- | --- |
 | `CPU` | native Rust | every wheel |
 | `CoreML`, `CoreMLFast` | Apple CoreML | macOS arm64 wheel |
-| `CUDA`, `CUDAFast` | native NVIDIA backend, Turing or newer | Linux x86_64 wheel |
+| `CUDA`, `CUDAFast` | native NVIDIA backend, Turing or newer | Linux x86_64 and Windows x86_64 wheels |
 
 `available_modes()` lists the modes compiled into the installed wheel. A CUDA
 mode can still fail at load time without an NVIDIA driver; that raises
@@ -37,7 +37,7 @@ mode can still fail at load time without an NVIDIA driver; that raises
 - `prepare(mode="CPU", *, cache_dir=None, model_dir=None, manifest=None, progress=None) -> PreparedModels`
 - `generate_manifest(model_dir, mode="CPU") -> ModelManifest`, with `to_json()` and `ModelManifest.from_json()`
 - `required_model_files(mode="CPU") -> list[str]`
-- `default_cache_dir() -> Path`: `$SPEAKRS_CACHE_DIR`, else `$HF_HOME/hub`, else `~/.cache/huggingface/hub`
+- `default_cache_dir() -> Path`: `$SPEAKRS_CACHE_DIR`, else `$HF_HUB_CACHE`, else `$HF_HOME/hub`, else `~/.cache/huggingface/hub`
 - `list_cache(cache_dir=None) -> list[CacheEntry]`
 - `cleanup_revision(revision, cache_dir=None) -> bool`
 - `DEFAULT_MODEL_REPOSITORY`, `DEFAULT_MODEL_REVISION`
@@ -117,7 +117,9 @@ These are frozen value objects; omitted arguments keep the defaults.
 - `ClusteringConfig(ahc=None, vbx=None, speaker_keep_threshold=None)`
 - `AhcConfig(threshold=None)`
 - `VbxConfig(fa=None, fb=None, max_iters=None, epsilon=None, init_smoothing=None)`
-- `RuntimeConfig(*, coreml_compute_units=None, cuda_segmentation_math=None, cuda_embedding_math=None, cuda_graphs=None)`
+- `RuntimeConfig(*, coreml_compute_units=None, coreml_segmentation_batch=None, cuda_segmentation_math=None, cuda_embedding_math=None, cuda_graphs=None)`;
+  `coreml_segmentation_batch` is the largest CoreML segmentation batch, `1`, `32`, or
+  `64` (default), and a smaller batch lowers peak memory
 
 Out-of-range values raise `SpeakrsError` with category `configuration`. Setting
 a `RuntimeConfig` option whose backend the wheel lacks raises it with category
